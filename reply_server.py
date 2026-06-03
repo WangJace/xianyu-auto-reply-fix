@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import List, Tuple, Optional, Dict, Any, Callable, Awaitable
@@ -29,6 +29,7 @@ from db_manager import db_manager
 from config import RISK_CONTROL
 from file_log_collector import setup_file_logging, get_file_log_collector
 from ai_reply_engine import ai_reply_engine
+from blacklist_service import blacklist_service
 from utils.qr_login import qr_login_manager
 from utils.qr_login_lite import qrcode_login_lite
 from utils.xianyu_utils import trans_cookies
@@ -1021,6 +1022,37 @@ def log_with_user(level: str, message: str, user_info: Dict[str, Any] = None):
         logger.info(full_message)
 
 
+def _get_blacklist_block_by_cookie(cookie_id: str, buyer_id: str, item_id: str = None) -> Optional[Dict[str, Any]]:
+    """按 cookie 归属检查买家是否命中个人黑名单。"""
+    try:
+        normalized_cookie_id = str(cookie_id or '').strip()
+        normalized_buyer_id = str(buyer_id or '').strip()
+        if not normalized_cookie_id or not normalized_buyer_id:
+            return None
+        cookie_details = db_manager.get_cookie_details(normalized_cookie_id)
+        user_id = cookie_details.get('user_id') if cookie_details else None
+        if not user_id:
+            return None
+        return blacklist_service.is_buyer_blacklisted(
+            user_id=user_id,
+            buyer_id=normalized_buyer_id,
+            cookie_id=normalized_cookie_id,
+            item_id=str(item_id or '').strip() or None,
+        )
+    except Exception as e:
+        logger.warning(f"检查黑名单失败: cookie_id={cookie_id}, buyer_id={buyer_id}, error={mask_sensitive_text(e)}")
+        return None
+
+
+def _format_blacklist_block_message(hit: Dict[str, Any]) -> str:
+    if not hit:
+        return '买家命中黑名单，已拦截'
+    scope_label = {'item': '商品级', 'account': '账号级', 'user': '用户级'}.get(hit.get('scope'), hit.get('scope') or '未知级别')
+    reason = str(hit.get('reason') or '').strip()
+    reason_part = f"，原因：{reason}" if reason else ''
+    return f"买家 {hit.get('buyer_id') or ''} 命中{scope_label}黑名单{reason_part}，已拦截"
+
+
 def match_reply(cookie_id: str, message: str) -> Optional[str]:
     """根据 cookie_id 及消息内容匹配回复
     只有启用的账号才会匹配关键字回复
@@ -1064,6 +1096,23 @@ class ResponseData(BaseModel):
 class ResponseModel(BaseModel):
     code: int
     data: ResponseData
+
+
+class PersonalBlacklistCreateRequest(BaseModel):
+    buyer_ids: Any
+    cookie_id: Optional[str] = None
+    item_id: Optional[str] = None
+    buyer_nick: Optional[str] = ''
+    reason: Optional[str] = ''
+    is_enabled: bool = True
+
+
+class PersonalBlacklistBatchDeleteRequest(BaseModel):
+    ids: List[int]
+
+
+class PersonalBlacklistToggleRequest(BaseModel):
+    is_enabled: bool
 
 
 app = FastAPI(
@@ -2321,6 +2370,12 @@ async def send_message_api(request: SendMessageRequest):
                     message=f"参数 {param_name} 不能为空"
                 )
 
+        blacklist_hit = _get_blacklist_block_by_cookie(cleaned_cookie_id, cleaned_to_user_id)
+        if blacklist_hit:
+            block_message = _format_blacklist_block_message(blacklist_hit)
+            logger.warning(f"API发送消息被黑名单拦截: cookie_id={cleaned_cookie_id}, buyer_id={cleaned_to_user_id}, scope={blacklist_hit.get('scope')}")
+            return SendMessageResponse(success=False, message=block_message)
+
         # 直接获取XianyuLive实例，跳过cookie_manager检查
         from XianyuAutoAsync import XianyuLive, ConnectionState
         live_instance = XianyuLive.get_instance(cleaned_cookie_id)
@@ -2390,6 +2445,23 @@ async def send_message_api(request: SendMessageRequest):
 
 @app.post("/xianyu/reply", response_model=ResponseModel)
 async def xianyu_reply(req: RequestModel):
+    blacklist_hit = _get_blacklist_block_by_cookie(req.cookie_id, req.send_user_id, req.item_id)
+    if blacklist_hit:
+        logger.warning(
+            f"/xianyu/reply 被黑名单拦截: cookie_id={req.cookie_id}, buyer_id={req.send_user_id}, "
+            f"item_id={req.item_id}, scope={blacklist_hit.get('scope')}"
+        )
+        return JSONResponse(
+            status_code=403,
+            content={
+                'success': False,
+                'blocked': True,
+                'reason': 'buyer_blacklisted',
+                'message': _format_blacklist_block_message(blacklist_hit),
+                'blacklist': blacklist_hit,
+            },
+        )
+
     msg_template = match_reply(req.cookie_id, req.send_message)
     is_default_reply = False
 
@@ -2431,6 +2503,168 @@ async def xianyu_reply(req: RequestModel):
             db_manager.add_default_reply_record(req.cookie_id, req.chat_id)
 
     return {"code": 200, "data": {"send_msg": send_msg}}
+
+
+# ------------------------- 黑名单接口 -------------------------
+
+
+@app.get('/api/blacklist/personal')
+def get_personal_blacklist(
+    buyer_id: str = None,
+    buyer_nick: str = None,
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        result = blacklist_service.list_personal(
+            user_id=current_user['user_id'],
+            buyer_id=buyer_id,
+            buyer_nick=buyer_nick,
+            page=page,
+            page_size=page_size,
+        )
+        return {'success': True, **result}
+    except Exception as e:
+        log_with_user('error', f"查询个人黑名单失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='查询个人黑名单失败')
+
+
+@app.post('/api/blacklist/personal')
+def create_personal_blacklist(
+    request: PersonalBlacklistCreateRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        cookie_id = str(request.cookie_id or '').strip() or None
+        if cookie_id:
+            cookie_id = _ensure_cookie_access(cookie_id, current_user)
+
+        result = blacklist_service.create_personal(
+            user_id=current_user['user_id'],
+            buyer_ids=request.buyer_ids,
+            cookie_id=cookie_id,
+            item_id=str(request.item_id or '').strip() or None,
+            reason=str(request.reason or '').strip(),
+            is_enabled=bool(request.is_enabled),
+            buyer_nick=str(request.buyer_nick or '').strip(),
+        )
+        created = int(result.get('created') or 0)
+        skipped = int(result.get('skipped') or 0)
+        message = f"成功添加 {created} 条黑名单"
+        if skipped:
+            message += f"，跳过 {skipped} 条"
+        log_with_user('info', f"新增个人黑名单: created={created}, skipped={skipped}", current_user)
+        return {'success': True, 'message': message, 'data': {'count': created, 'skipped': skipped, 'records': result.get('records') or []}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"新增个人黑名单失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='新增个人黑名单失败')
+
+
+@app.post('/api/blacklist/personal/batch-delete')
+def batch_delete_personal_blacklist(
+    request: PersonalBlacklistBatchDeleteRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        deleted = blacklist_service.batch_delete_personal(request.ids, current_user['user_id'])
+        return {'success': True, 'message': f'成功删除 {deleted} 条黑名单', 'data': {'deleted': deleted}}
+    except Exception as e:
+        log_with_user('error', f"批量删除个人黑名单失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='批量删除个人黑名单失败')
+
+
+@app.patch('/api/blacklist/personal/{record_id}/toggle')
+def toggle_personal_blacklist(
+    record_id: int,
+    request: PersonalBlacklistToggleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        success = blacklist_service.toggle_personal(record_id, current_user['user_id'], request.is_enabled)
+        if not success:
+            raise HTTPException(status_code=404, detail='黑名单记录不存在')
+        return {'success': True, 'message': '状态已更新'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"更新个人黑名单状态失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='更新个人黑名单状态失败')
+
+
+@app.delete('/api/blacklist/personal/{record_id}')
+def delete_personal_blacklist(
+    record_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        success = blacklist_service.delete_personal(record_id, current_user['user_id'])
+        if not success:
+            raise HTTPException(status_code=404, detail='黑名单记录不存在')
+        return {'success': True, 'message': '删除成功'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f"删除个人黑名单失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='删除个人黑名单失败')
+
+
+@app.get('/api/blacklist/personal/export')
+def export_personal_blacklist(current_user: Dict[str, Any] = Depends(get_current_user)):
+    try:
+        content = blacklist_service.export_personal_xlsx(current_user['user_id'])
+        filename = f"personal_blacklist_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        headers = {'Content-Disposition': f'attachment; filename="{filename}"'}
+        return Response(
+            content=content,
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers=headers,
+        )
+    except Exception as e:
+        log_with_user('error', f"导出个人黑名单失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='导出个人黑名单失败')
+
+
+@app.post('/api/blacklist/personal/import')
+async def import_personal_blacklist(
+    file: UploadFile = File(...),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        filename = file.filename or ''
+        if not filename.lower().endswith('.xlsx'):
+            raise HTTPException(status_code=400, detail='仅支持 .xlsx 文件')
+        content = await file.read()
+        result = blacklist_service.import_personal_xlsx(current_user['user_id'], content)
+        return {
+            'success': True,
+            'message': f"导入完成：新增 {result.get('created', 0)} 条，跳过 {result.get('skipped', 0)} 条",
+            'data': result,
+        }
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log_with_user('error', f"导入个人黑名单失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='导入个人黑名单失败')
+
+
+@app.get('/api/blacklist/platform')
+def get_platform_blacklist(
+    page: int = 1,
+    page_size: int = 20,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        result = blacklist_service.list_platform(current_user['user_id'], page=page, page_size=page_size)
+        return {'success': True, **result}
+    except Exception as e:
+        log_with_user('error', f"查询平台黑名单失败: {mask_sensitive_text(e)}", current_user)
+        raise HTTPException(status_code=500, detail='查询平台黑名单失败')
+
 
 # ------------------------- 账号 / 关键字管理接口 -------------------------
 
@@ -12987,6 +13221,20 @@ async def chat_send_message(
         if not live_instance.ws:
             raise HTTPException(status_code=400, detail="WebSocket连接未就绪")
 
+        item_id_for_blacklist = None
+        try:
+            recent_order = db_manager.get_recent_order_by_sid(req.chat_id, cookie_id, minutes=60)
+            if recent_order and str(recent_order.get('buyer_id') or '') == str(req.to_user_id or ''):
+                item_id_for_blacklist = recent_order.get('item_id')
+        except Exception:
+            item_id_for_blacklist = None
+
+        blacklist_hit = _get_blacklist_block_by_cookie(cookie_id, req.to_user_id, item_id_for_blacklist)
+        if blacklist_hit:
+            block_message = _format_blacklist_block_message(blacklist_hit)
+            logger.warning(f"客服发送消息被黑名单拦截: cookie_id={cookie_id}, buyer_id={req.to_user_id}, scope={blacklist_hit.get('scope')}")
+            return {'success': False, 'blocked': True, 'message': block_message, 'blacklist': blacklist_hit}
+
         await _run_live_instance_on_manager_loop(
             cookie_id,
             lambda: live_instance.send_msg(
@@ -13250,6 +13498,32 @@ async def manual_deliver_order(order_id: str, current_user: Dict[str, Any] = Dep
 
         if not buyer_id:
             return {"success": False, "delivered": False, "message": "订单缺少买家信息，无法发送消息"}
+
+        blacklist_hit = blacklist_service.is_buyer_blacklisted(
+            user_id=user_id,
+            buyer_id=buyer_id,
+            cookie_id=cookie_id,
+            item_id=item_id,
+        )
+        if blacklist_hit:
+            block_message = _format_blacklist_block_message(blacklist_hit)
+            db_manager.create_delivery_log(
+                user_id=user_id,
+                cookie_id=cookie_id,
+                order_id=order_id,
+                item_id=item_id,
+                buyer_id=buyer_id,
+                buyer_nick=order.get('buyer_nick'),
+                rule_id=None,
+                rule_keyword=None,
+                card_type=None,
+                match_mode='blacklist',
+                channel='manual',
+                status='skipped',
+                reason=block_message,
+            )
+            log_with_user('warning', f"手动发货被黑名单拦截: order_id={order_id}, buyer_id={buyer_id}, scope={blacklist_hit.get('scope')}", current_user)
+            return {"success": False, "delivered": False, "blocked": True, "message": block_message, "blacklist": blacklist_hit}
 
         # 获取商品标题
         item_info = db_manager.get_item_info(cookie_id, item_id)
