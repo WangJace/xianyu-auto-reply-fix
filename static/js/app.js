@@ -22384,6 +22384,7 @@ let chatSseShouldRun = false;
 let chatUserInfoCache = {};
 let chatUserInfoHydrationTimer = null;
 const CHAT_USER_INFO_MISS_TTL_MS = 10 * 60 * 1000;
+let chatBlacklistState = { loading: false, blacklisted: false, can_unblock: false, scope: '', record: null, account_record: null };
 
 function buildSafeCheckboxId(prefix, rawValue) {
     const normalized = String(rawValue || '')
@@ -22490,6 +22491,153 @@ function syncActiveChatHeaderName() {
     chatCurrentSenderName = resolveSessionDisplayName(currentSession);
     const headerName = document.getElementById('chatHeaderName');
     if (headerName) headerName.textContent = chatCurrentSenderName;
+}
+
+function getChatBlacklistScopeLabel(scope) {
+    return { item: '商品级', account: '账号级', user: '用户级' }[scope] || '其他范围';
+}
+
+function resetChatBlacklistState() {
+    chatBlacklistState = { loading: false, blacklisted: false, can_unblock: false, scope: '', record: null, account_record: null };
+    renderChatBlacklistButton();
+}
+
+function renderChatBlacklistButton() {
+    const btn = document.getElementById('chatBlacklistBtn');
+    const text = document.getElementById('chatBlacklistBtnText');
+    if (!btn) return;
+
+    const hasBuyer = Boolean(chatCurrentCookieId && chatCurrentChatId && chatCurrentToUserId);
+    btn.classList.remove('btn-outline-danger', 'btn-danger', 'btn-outline-secondary', 'btn-outline-warning');
+
+    if (!hasBuyer) {
+        btn.disabled = true;
+        btn.title = '缺少买家ID，无法拉黑';
+        btn.classList.add('btn-outline-secondary');
+        btn.innerHTML = '<i class="bi bi-person-slash"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">拉黑</span>';
+        return;
+    }
+
+    if (chatBlacklistState.loading) {
+        btn.disabled = true;
+        btn.title = '正在查询黑名单状态';
+        btn.classList.add('btn-outline-secondary');
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm" role="status" aria-hidden="true"></span><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">检查中</span>';
+        return;
+    }
+
+    if (chatBlacklistState.blacklisted) {
+        if (chatBlacklistState.can_unblock) {
+            btn.disabled = false;
+            btn.title = '解除当前账号级黑名单';
+            btn.classList.add('btn-outline-warning');
+            btn.innerHTML = '<i class="bi bi-person-check"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">解除拉黑</span>';
+        } else {
+            btn.disabled = true;
+            btn.title = `已命中${getChatBlacklistScopeLabel(chatBlacklistState.scope)}黑名单，请到黑名单管理解除`;
+            btn.classList.add('btn-outline-secondary');
+            btn.innerHTML = '<i class="bi bi-shield-lock"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">已拉黑</span>';
+        }
+        return;
+    }
+
+    btn.disabled = false;
+    btn.title = '将当前买家加入当前账号黑名单';
+    btn.classList.add('btn-outline-danger');
+    btn.innerHTML = '<i class="bi bi-person-slash"></i><span class="d-none d-xl-inline ms-1" id="chatBlacklistBtnText">拉黑</span>';
+    if (text) text.textContent = '拉黑';
+}
+
+async function refreshChatBlacklistStatus() {
+    if (!chatCurrentCookieId || !chatCurrentToUserId) {
+        resetChatBlacklistState();
+        return;
+    }
+
+    const cookieId = chatCurrentCookieId;
+    const buyerId = chatCurrentToUserId;
+    chatBlacklistState = { ...chatBlacklistState, loading: true };
+    renderChatBlacklistButton();
+
+    try {
+        const token = getAuthToken();
+        const response = await fetch(`${apiBase}/api/chat/blacklist-status?cookie_id=${encodeURIComponent(cookieId)}&buyer_id=${encodeURIComponent(buyerId)}`, {
+            headers: token ? { 'Authorization': `Bearer ${token}` } : {},
+            cache: 'no-store',
+        });
+        if (response.status === 401) {
+            stopChatStream();
+            localStorage.removeItem('auth_token');
+            window.location.href = '/';
+            return;
+        }
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const result = await response.json();
+        if (cookieId !== chatCurrentCookieId || buyerId !== chatCurrentToUserId) return;
+        const data = result?.data || {};
+        chatBlacklistState = {
+            loading: false,
+            blacklisted: Boolean(data.blacklisted),
+            can_unblock: Boolean(data.can_unblock),
+            scope: data.scope || '',
+            record: data.record || null,
+            account_record: data.account_record || null,
+        };
+    } catch (error) {
+        console.debug('查询客服黑名单状态失败:', error);
+        chatBlacklistState = { ...chatBlacklistState, loading: false };
+    }
+    renderChatBlacklistButton();
+}
+
+async function toggleChatBlacklist() {
+    if (!chatCurrentCookieId || !chatCurrentToUserId) {
+        showToast('当前会话缺少买家ID，无法拉黑', 'warning');
+        return;
+    }
+    if (chatBlacklistState.blacklisted && !chatBlacklistState.can_unblock) {
+        showToast(`该买家命中${getChatBlacklistScopeLabel(chatBlacklistState.scope)}黑名单，请到黑名单管理解除`, 'warning');
+        return;
+    }
+
+    const action = chatBlacklistState.blacklisted ? 'unblock' : 'block';
+    const actionLabel = action === 'block' ? '拉黑' : '解除拉黑';
+    const confirmMessage = action === 'block'
+        ? `确认将买家 ${chatCurrentSenderName || chatCurrentToUserId} 加入当前账号黑名单吗？\n\n加入后自动回复、客服发送和发货流程都会拦截该买家。`
+        : `确认解除买家 ${chatCurrentSenderName || chatCurrentToUserId} 的当前账号黑名单吗？`;
+    if (!window.confirm(confirmMessage)) return;
+
+    chatBlacklistState = { ...chatBlacklistState, loading: true };
+    renderChatBlacklistButton();
+
+    try {
+        const result = await fetchJSON(`${apiBase}/api/chat/blacklist-toggle`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                cookie_id: chatCurrentCookieId,
+                buyer_id: chatCurrentToUserId,
+                buyer_nick: chatCurrentSenderName || '',
+                action,
+                reason: '在线客服手动拉黑',
+            }),
+        });
+        const data = result?.data || {};
+        chatBlacklistState = {
+            loading: false,
+            blacklisted: Boolean(data.blacklisted),
+            can_unblock: Boolean(data.can_unblock),
+            scope: data.scope || '',
+            record: data.record || null,
+            account_record: data.account_record || null,
+        };
+        showToast(result.message || `${actionLabel}成功`, result.success === false ? 'warning' : 'success');
+    } catch (error) {
+        console.error(`${actionLabel}失败:`, error);
+        chatBlacklistState = { ...chatBlacklistState, loading: false };
+        showToast(`${actionLabel}失败`, 'danger');
+    }
+    renderChatBlacklistButton();
 }
 
 function rerenderChatSessionsAfterUserInfoUpdate() {
@@ -22737,6 +22885,7 @@ async function selectChatAccount(cookieId) {
     chatCurrentToUserId = '';
     chatCurrentSenderName = '';
     chatCurrentItemId = '';
+    resetChatBlacklistState();
     chatSessionsNextCursor = null;
     chatSessionsHasMore = false;
     chatMessagesNextCursor = null;
@@ -22954,9 +23103,17 @@ async function selectChatSession(session) {
     const headerName = document.getElementById('chatHeaderName');
     if (headerName) headerName.textContent = chatCurrentSenderName;
     updateChatHeaderMeta(session);
+    resetChatBlacklistState();
+    renderChatBlacklistButton();
+    if (chatCurrentToUserId) {
+        refreshChatBlacklistStatus();
+    }
 
     renderChatSessions(chatSessionsCache);
     await loadChatMessages(false);
+    if (chatCurrentToUserId) {
+        refreshChatBlacklistStatus();
+    }
 
     if (!document.getElementById('chatReplyPanel')?.classList.contains('d-none') && chatCurrentItemId) {
         await loadItemKeywords();

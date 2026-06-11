@@ -1056,6 +1056,48 @@ def _format_blacklist_block_message(hit: Dict[str, Any]) -> str:
     return f"买家 {hit.get('buyer_id') or ''} 命中{scope_label}黑名单{reason_part}，已拦截"
 
 
+def _find_exact_account_blacklist_record(user_id: int, buyer_id: str, cookie_id: str) -> Optional[Dict[str, Any]]:
+    """查找当前账号维度的个人黑名单记录（包含禁用记录）。"""
+    normalized_buyer_id = str(buyer_id or '').strip()
+    normalized_cookie_id = str(cookie_id or '').strip()
+    if not user_id or not normalized_buyer_id or not normalized_cookie_id:
+        return None
+
+    result = blacklist_service.list_personal(
+        user_id=user_id,
+        buyer_id=normalized_buyer_id,
+        page=1,
+        page_size=200,
+    )
+    for record in result.get('data') or []:
+        if (
+            str(record.get('buyer_id') or '').strip() == normalized_buyer_id
+            and str(record.get('cookie_id') or '').strip() == normalized_cookie_id
+            and not str(record.get('item_id') or '').strip()
+        ):
+            return record
+    return None
+
+
+def _build_chat_blacklist_status(user_id: int, buyer_id: str, cookie_id: str) -> Dict[str, Any]:
+    normalized_buyer_id = str(buyer_id or '').strip()
+    normalized_cookie_id = str(cookie_id or '').strip()
+    exact_record = _find_exact_account_blacklist_record(user_id, normalized_buyer_id, normalized_cookie_id)
+    effective_hit = blacklist_service.is_buyer_blacklisted(
+        user_id=user_id,
+        buyer_id=normalized_buyer_id,
+        cookie_id=normalized_cookie_id,
+    )
+    exact_enabled = bool(exact_record and exact_record.get('is_enabled'))
+    return {
+        'blacklisted': bool(effective_hit),
+        'can_unblock': exact_enabled,
+        'scope': (effective_hit or {}).get('scope'),
+        'record': effective_hit,
+        'account_record': exact_record,
+    }
+
+
 def match_reply(cookie_id: str, message: str) -> Optional[str]:
     """根据 cookie_id 及消息内容匹配回复
     只有启用的账号才会匹配关键字回复
@@ -2896,6 +2938,14 @@ class ChatAvatarQuery(BaseModel):
 class ChatAvatarBatchRequest(BaseModel):
     cookie_id: str
     queries: List[ChatAvatarQuery] = []
+
+
+class ChatBlacklistToggleRequest(BaseModel):
+    cookie_id: str
+    buyer_id: str
+    buyer_nick: Optional[str] = ''
+    action: str
+    reason: Optional[str] = ''
 
 
 class SaveItemKeywordsRequest(BaseModel):
@@ -13901,6 +13951,87 @@ async def get_chat_sessions(
     except Exception as e:
         logger.error(f"获取会话列表失败: {mask_sensitive_text(e)}")
         raise HTTPException(status_code=500, detail="获取会话列表失败")
+
+
+@app.get('/api/chat/blacklist-status')
+async def get_chat_blacklist_status(
+    cookie_id: str,
+    buyer_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询在线客服当前买家是否命中个人黑名单。"""
+    try:
+        cookie_id = _ensure_cookie_access(cookie_id, current_user)
+        normalized_buyer_id = str(buyer_id or '').strip()
+        if not normalized_buyer_id:
+            raise HTTPException(status_code=400, detail='缺少买家ID')
+        status_payload = _build_chat_blacklist_status(current_user['user_id'], normalized_buyer_id, cookie_id)
+        return {'success': True, 'data': status_payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"查询客服黑名单状态失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail='查询客服黑名单状态失败')
+
+
+@app.post('/api/chat/blacklist-toggle')
+async def toggle_chat_blacklist(
+    req: ChatBlacklistToggleRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """在线客服一键加入/解除当前账号维度的个人黑名单。"""
+    try:
+        cookie_id = _ensure_cookie_access(req.cookie_id, current_user)
+        buyer_id = str(req.buyer_id or '').strip()
+        if not buyer_id:
+            raise HTTPException(status_code=400, detail='缺少买家ID')
+
+        action = str(req.action or '').strip().lower()
+        if action not in {'block', 'unblock'}:
+            raise HTTPException(status_code=400, detail='无效操作')
+
+        user_id = current_user['user_id']
+        exact_record = _find_exact_account_blacklist_record(user_id, buyer_id, cookie_id)
+
+        if action == 'block':
+            if exact_record:
+                if not exact_record.get('is_enabled'):
+                    blacklist_service.toggle_personal(int(exact_record['id']), user_id, True)
+                message = '已加入当前账号黑名单'
+            else:
+                reason = str(req.reason or '').strip() or '在线客服手动拉黑'
+                result = blacklist_service.create_personal(
+                    user_id=user_id,
+                    buyer_ids=[buyer_id],
+                    cookie_id=cookie_id,
+                    buyer_nick=str(req.buyer_nick or '').strip(),
+                    reason=reason,
+                    is_enabled=True,
+                )
+                if int(result.get('created') or 0) <= 0 and int(result.get('skipped') or 0) <= 0:
+                    raise HTTPException(status_code=500, detail='加入黑名单失败')
+                message = '已加入当前账号黑名单'
+            log_with_user('info', f"客服会话拉黑买家: cookie_id={cookie_id}, buyer_id={buyer_id}", current_user)
+        else:
+            if not exact_record:
+                status_payload = _build_chat_blacklist_status(user_id, buyer_id, cookie_id)
+                scope_label = {'item': '商品级', 'account': '账号级', 'user': '用户级'}.get(status_payload.get('scope'), '其他范围')
+                return {
+                    'success': False,
+                    'message': f'未找到当前账号级黑名单记录；如仍显示已拉黑，可能命中{scope_label}黑名单，请到黑名单管理解除',
+                    'data': status_payload,
+                }
+            blacklist_service.toggle_personal(int(exact_record['id']), user_id, False)
+            message = '已解除当前账号黑名单'
+            log_with_user('info', f"客服会话解除拉黑买家: cookie_id={cookie_id}, buyer_id={buyer_id}, record_id={exact_record.get('id')}", current_user)
+
+        status_payload = _build_chat_blacklist_status(user_id, buyer_id, cookie_id)
+        return {'success': True, 'message': message, 'data': status_payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"客服黑名单操作失败: {mask_sensitive_text(e)}")
+        raise HTTPException(status_code=500, detail='客服黑名单操作失败')
 
 
 @app.post('/api/chat/avatars')
